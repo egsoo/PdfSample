@@ -3,13 +3,16 @@ Telegram Bot
 """
 
 import logging
+import os
 import traceback
 from asyncio import CancelledError, Task, create_task, run
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from itertools import zip_longest
 from pathlib import Path
 from shutil import rmtree
+from threading import Thread
 from typing import Any, cast
 
 import orjson
@@ -40,10 +43,31 @@ bot_info = {}
 logger = logging.getLogger(__name__)
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+def start_health_server() -> None:
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+
 async def create_bot() -> TelegramClient:
-    client = TelegramClient(str(STATE_DIR / 'utils-bot'), API_ID, API_HASH)
+    client = TelegramClient(str(STATE_DIR / "utils-bot"), API_ID, API_HASH)
     await client.start(bot_token=BOT_TOKEN)  # ty: ignore[invalid-await]
-    client.parse_mode = 'html'
+    client.parse_mode = "html"
     return client
 
 
@@ -64,19 +88,20 @@ def get_permission_manager() -> PermissionManager:
 
 def main() -> None:
     """Run bot."""
+    Thread(target=start_health_server, daemon=True).start()
     run(run_bot())
 
 
 async def handle_restart() -> None:
-    restart_path = Path('restart.json')
+    restart_path = Path("restart.json")
     if not restart_path.exists():
         return
 
     restart_message = orjson.loads(restart_path.read_text())
     await get_bot().edit_message(
-        restart_message['chat'],
-        restart_message['message'],
-        t('restarted_successfully'),
+        restart_message["chat"],
+        restart_message["message"],
+        t("restarted_successfully"),
     )
     restart_path.unlink()
 
@@ -92,17 +117,22 @@ async def handle_module_execution(
         event, CallbackQuery.Event
     ):
         reply_message = await get_reply_message(event)
+
     if isinstance(event, NewMessage.Event):
         base_message = event.message
     else:
         base_message = await event.get_message()
         if base_message is None:
             return
+
     message = reply_message or base_message
-    if not hasattr(event.client, 'active_tasks'):
+
+    if not hasattr(event.client, "active_tasks"):
         event.client.active_tasks = {}
+
     active_tasks: dict[str, ActiveTask] = event.client.active_tasks
-    task_id = next_task_id(active_tasks, f'{message.chat_id}_{message.id}')
+    task_id = next_task_id(active_tasks, f"{message.chat_id}_{message.id}")
+
     task: Task[bool] = create_task(module.handle(event, command))
     active_tasks[task_id] = ActiveTask(
         task=task,
@@ -114,14 +144,14 @@ async def handle_module_execution(
     try:
         await task
     except CancelledError:
-        await response_func(t('operation_cancelled'))
+        await response_func(t("operation_cancelled"))
     except StopPropagation:
         pass
     except Exception as e:  # noqa: BLE001
         logger.error(
             f'Error in module {module.name}: {"\n".join(traceback.format_exception(None, e, e.__traceback__))}'
         )
-        await response_func(t('an_error_occurred', error=f'{e!s}'[:100]))
+        await response_func(t("an_error_occurred", error=f"{e!s}"[:100]))
     finally:
         active_tasks.pop(task_id, None)
 
@@ -130,24 +160,30 @@ async def handle_commands(event: NewMessage.Event) -> None:
     match = event.pattern_match
     if match is None:
         raise StopPropagation
+
     command = match.group(1)
     modifier = match.group(2)
+
     if modifier and command in event.client.commands_with_modifiers:
-        command = f'{command} {modifier}'
+        command = f"{command} {modifier}"
 
     modules_registry = event.client.modules_registry
     perms = event.client.permission_manager
     user_id = event.sender_id or event.chat_id
+
     module = modules_registry.get_module_by_command(
         command
     ) or modules_registry.get_module_by_command(match.group(1))
+
     if not module or not perms.has_permission(module.name, user_id, event.chat_id):
         raise StopPropagation
 
     reply_message = (
         await get_reply_message(event, previous=True) if event.message.is_reply else None
     )
-    cmd = module.commands.get(command) or module.commands.get(command.split(' ', 1)[0])
+
+    cmd = module.commands.get(command) or module.commands.get(command.split(" ", 1)[0])
+
     if not cmd or not matches_command(event, reply_message, cmd):
         raise StopPropagation
 
@@ -159,27 +195,34 @@ async def handle_messages(event: NewMessage.Event) -> None:
     if applicable_commands := await event.client.modules_registry.get_applicable_commands(event):
 
         def label_for_command(command: str) -> str:
-            key = f'_{command.replace(" ", "_")}'
+            key = f"_{command.replace(' ', '_')}"
             try:
-                return f'{t(key)}'
+                return f"{t(key)}"
             except KeyError:
                 return command
 
         keyboard = [
             [
-                Button.inline(label_for_command(command), data=f'm|{command.replace(" ", "_")}')
+                Button.inline(
+                    label_for_command(command),
+                    data=f"m|{command.replace(' ', '_')}",
+                )
                 for command in row
                 if command is not None
             ]
             for row in list(
                 zip_longest(
-                    *[iter(sorted(applicable_commands, key=label_for_command))] * 3, fillvalue=None
+                    *[iter(sorted(applicable_commands, key=label_for_command))] * 3,
+                    fillvalue=None,
                 )
             )
         ]
-        await event.reply(t('choose_an_option'), buttons=keyboard)
+
+        await event.reply(t("choose_an_option"), buttons=keyboard)
+
     elif event.is_private:
-        await event.reply(t('no_applicable_modules'))
+        await event.reply(t("no_applicable_modules"))
+
     raise StopPropagation
 
 
@@ -199,13 +242,18 @@ async def handle_collector_callback(event: CallbackQuery.Event) -> None:
 
 
 async def handle_callback(event: CallbackQuery.Event) -> None:
-    command = event.data.decode('utf-8')
-    if command.startswith('m|'):
+    command = event.data.decode("utf-8")
+
+    if command.startswith("m|"):
         command = command[2:]
-    command = command.replace('_', ' ')
+
+    command = command.replace("_", " ")
+
     perms = event.client.permission_manager
     user_id = event.sender_id or event.chat_id
-    module = event.client.modules_registry.get_module_by_command(command.split('|')[0])
+
+    module = event.client.modules_registry.get_module_by_command(command.split("|")[0])
+
     if not module or not perms.has_permission(module.name, user_id, event.chat_id):
         return
 
@@ -220,29 +268,35 @@ async def handle_inline_query(event: InlineQuery.Event) -> None:
         if isinstance(module, InlineModuleBase) and await module.is_applicable(event):
             await module.handle(event)
             break
+
     raise StopPropagation
 
 
 async def start_command(event: NewMessage.Event) -> None:
-    await event.reply(t('welcome'))
+    await event.reply(t("welcome"))
     raise StopPropagation
 
 
 async def cancel_command(event: NewMessage.Event) -> None:
     original_message = await get_reply_message(event)
-    base_task_id = f'{original_message.chat_id}_{original_message.id}'
-    active_tasks: dict[str, ActiveTask] = getattr(event.client, 'active_tasks', {})
+    base_task_id = f"{original_message.chat_id}_{original_message.id}"
+
+    active_tasks: dict[str, ActiveTask] = getattr(event.client, "active_tasks", {})
+
     task_ids = [
         task_id
         for task_id in active_tasks
-        if task_id == base_task_id or task_id.startswith(f'{base_task_id}_')
+        if task_id == base_task_id or task_id.startswith(f"{base_task_id}_")
     ]
+
     if not task_ids:
-        await event.reply(t('no_active_operation'))
+        await event.reply(t("no_active_operation"))
         return
+
     for task_id in task_ids:
         active_tasks[task_id].task.cancel()
-    await event.reply(t('operation_cancellation_requested'))
+
+    await event.reply(t("operation_cancellation_requested"))
     raise StopPropagation
 
 
@@ -250,60 +304,106 @@ async def run_bot() -> None:
     """Run the bot."""
     rmtree(TMP_DIR, ignore_errors=True)
     TMP_DIR.mkdir(exist_ok=True)
-    state.permission_manager = PermissionManager(set(BOT_ADMINS), STATE_DIR / 'permissions.json')
-    state.modules_registry = ModuleRegistry(__package__ or __name__, state.permission_manager)
+
+    state.permission_manager = PermissionManager(
+        set(BOT_ADMINS),
+        STATE_DIR / "permissions.json",
+    )
+
+    state.modules_registry = ModuleRegistry(
+        __package__ or __name__,
+        state.permission_manager,
+    )
+
     commands_with_modifiers = {
-        command.split(' ', 1)[0]
+        command.split(" ", 1)[0]
         for module in state.modules_registry.modules
         for command in module.commands
-        if ' ' in command
+        if " " in command
     }
 
     state.bot = await create_bot()
     bot = cast(Any, get_bot())
+
     bot.modules_registry = get_modules_registry()
     bot.permission_manager = get_permission_manager()
     bot.commands_with_modifiers = commands_with_modifiers
     bot.reply_prompts = state.reply_prompts
     bot.file_collectors = state.file_collectors
 
-    # Get bot info
     me = await bot.get_me()
-    bot_info.update({'name': me.first_name, 'username': me.username, 'id': me.id})
-    logger.info(f'Bot started: {me.first_name} (@{me.username})')
-
-    # Register event handlers
-    bot.add_event_handler(start_command, NewMessage(pattern='/start'))
-    bot.add_event_handler(
-        cancel_command, NewMessage(pattern=r'^/cancel$', func=lambda x: x.message.is_reply)
+    bot_info.update(
+        {
+            "name": me.first_name,
+            "username": me.username,
+            "id": me.id,
+        }
     )
 
-    # Register module-specific handlers
+    logger.info(f"Bot started: {me.first_name} (@{me.username})")
+
+    bot.add_event_handler(
+        start_command,
+        NewMessage(pattern="/start"),
+    )
+
+    bot.add_event_handler(
+        cancel_command,
+        NewMessage(
+            pattern=r"^/cancel$",
+            func=lambda x: x.message.is_reply,
+        ),
+    )
+
     for module in get_modules_registry().modules:
-        if hasattr(module, 'register_handlers'):
+        if hasattr(module, "register_handlers"):
             module.register_handlers(bot)
 
-    # Register general handlers
-    bot.add_event_handler(handle_reply_prompts, NewMessage())
-    bot.add_event_handler(handle_file_collectors, NewMessage())
+    bot.add_event_handler(
+        handle_reply_prompts,
+        NewMessage(),
+    )
+
+    bot.add_event_handler(
+        handle_file_collectors,
+        NewMessage(),
+    )
+
     bot.add_event_handler(
         handle_commands,
         NewMessage(
             pattern=rf'^/(\w+)(?:@{bot_info["username"]})?(?:\s+(\w+))?(?:\s+(.+))?$',
-            func=lambda x: not any(x.message.text.startswith(c) for c in ('/start', '/cancel')),
+            func=lambda x: not any(
+                x.message.text.startswith(c)
+                for c in ("/start", "/cancel")
+            ),
         ),
     )
+
     bot.add_event_handler(
         handle_messages,
-        NewMessage(func=lambda x: not x.message.text.startswith('/') and not x.message.via_bot),
+        NewMessage(
+            func=lambda x: not x.message.text.startswith("/")
+            and not x.message.via_bot
+        ),
     )
-    bot.add_event_handler(handle_collector_callback, CallbackQuery(pattern=r'^c\|'))
-    bot.add_event_handler(handle_callback, CallbackQuery(pattern=r'^m|'))
-    bot.add_event_handler(handle_inline_query, InlineQuery(func=lambda x: len(x.text) > 2))
 
-    # Check if the bot is restarting
+    bot.add_event_handler(
+        handle_collector_callback,
+        CallbackQuery(pattern=r"^c\|"),
+    )
+
+    bot.add_event_handler(
+        handle_callback,
+        CallbackQuery(pattern=r"^m|"),
+    )
+
+    bot.add_event_handler(
+        handle_inline_query,
+        InlineQuery(func=lambda x: len(x.text) > 2),
+    )
+
     await handle_restart()
 
-    # Run blocking
     async with bot:
         await bot.run_until_disconnected()
