@@ -15,6 +15,7 @@ import pymupdf
 import regex as re
 from humanize import naturalsize
 from locro import ScreenAI
+from telethon import Button
 from telethon.events import CallbackQuery, NewMessage, StopPropagation
 from telethon.tl.custom import Message
 
@@ -46,6 +47,7 @@ PDF_SAVE_KWARGS = {
     'deflate_fonts': False,
     'use_objstms': True,
 }
+pending_merge_filenames: dict[tuple[int, int], tuple[list[int], list[int]]] = {}
 PDF_FONT_ZIP_THRESHOLD = 5
 SCREENAI_OCR_PATTERN = re.compile(r'^/(screenai)\s+(ocr)(?:\s+([\d,\-\s]+))?$')
 screenai_lock = Lock()
@@ -426,46 +428,127 @@ async def merge_pdf_initial(event: NewMessage.Event | CallbackQuery.Event) -> No
         t('send_more_pdf_files_to_merge'),
         first_message_id=reply_message.id,
         accept=lambda e: has_pdf_file(e, None),
-        on_finish=_merge_pdf_process,
+        on_finish=_ask_merge_filename,
         min_files=2,
         not_enough_files_text=t('not_enough_files'),
         added_reply_text=t('file_added'),
         finish_button_text=t('finish'),
+        cleanup_on_finish=False,
+        remove_button_text='Remove',
         allow_non_reply=True,
         reply_to=reply_message.id,
     )
     raise StopPropagation
 
 
-async def _merge_pdf_process(event: CallbackQuery.Event, files: list[int]) -> None:
-    await event.answer(t('merging'))
+async def _ask_merge_filename(event: CallbackQuery.Event, files: list[int]) -> None:
+    key = (event.chat_id, event.sender_id)
+    collector = event.client.file_collectors.collectors.get((event.chat_id, event.message_id))
+    cleanup_ids = (
+        [
+            collector.prompt_message_id,
+            *collector.file_message_ids,
+            *collector.notice_message_ids,
+        ]
+        if collector
+        else [event.message_id, *files]
+    )
+    pending_merge_filenames[key] = (files, cleanup_ids)
+    await event.edit(
+        'Choose a filename for the merged PDF:',
+        buttons=[[
+            Button.inline('Default', b'pdfmerge|default'),
+            Button.inline('Rename', b'pdfmerge|rename'),
+        ]],
+    )
+    await event.answer()
+
+
+async def _merge_filename_callback(event: CallbackQuery.Event) -> None:
+    key = (event.chat_id, event.sender_id)
+    merge = pending_merge_filenames.get(key)
+    if not merge:
+        return
+
+    files, cleanup_ids = merge
+    action = event.data.decode('utf-8').split('|')[-1]
+    if action == 'default':
+        pending_merge_filenames.pop(key, None)
+        await _merge_pdf_process(event, files, cleanup_ids)
+    elif action == 'rename':
+        await event.edit('Reply with the desired PDF filename:')
+
+        async def handle_filename(
+            reply_event: NewMessage.Event,
+            _reply_message: Message | None,
+            match: Any,
+        ) -> None:
+            filename = match.group(1).strip()
+            if (
+                not filename
+                or filename in {'.', '..'}
+                or '/' in filename
+                or '\\' in filename
+                or '\0' in filename
+                or len(filename.encode()) > 255
+            ):
+                await reply_event.reply('Please provide a valid filename.')
+                return
+            if Path(filename).suffix.lower() != '.pdf':
+                filename = f'{filename}.pdf'
+            pending_merge_filenames.pop(key, None)
+            await _merge_pdf_process(reply_event, files, cleanup_ids, filename)
+
+        await event.client.reply_prompts.ask(
+            event,
+            'Reply with the desired PDF filename:',
+            pattern=re.compile(r'^(.+)$'),
+            handler=handle_filename,
+            invalid_reply_text='Please provide a filename.',
+        )
+
+
+async def _merge_pdf_process(
+    event: NewMessage.Event | CallbackQuery.Event,
+    files: list[int],
+    cleanup_ids: list[int],
+    output_filename: str | None = None,
+) -> None:
+    if isinstance(event, CallbackQuery.Event):
+        await event.answer(t('merging'))
     status_message = await event.respond(t('starting_merge'))
     progress_message = await event.respond(t('merging'))
 
-    with pymupdf.open() as merged_pdf:
-        for file_id in files:
-            message = await event.client.get_messages(event.chat_id, ids=file_id)
-            async with download_to_temp_file(
-                event,
-                message,
-                progress_message,
-                suffix='.pdf',
-            ) as temp_file_path:
-                with pymupdf.open(temp_file_path) as pdf_doc:
-                    merged_pdf.insert_pdf(pdf_doc)
-        with NamedTemporaryFile(dir=TMP_DIR, suffix='.pdf') as out_file:
-            merged_pdf.save(out_file.name, **PDF_SAVE_KWARGS)
-            output_file_path = Path(out_file.name)
-            if output_file_path.exists() and output_file_path.stat().st_size:
-                output_file_path = output_file_path.rename(
-                    output_file_path.with_stem(f'merged_{Path(message.file.name).stem}')
-                )
-                await upload_file_and_cleanup(event, output_file_path, progress_message)
-                await status_message.edit(t('merge_completed'))
-            else:
-                await status_message.edit(t('merge_failed'))
-
-    await progress_message.delete()
+    try:
+        with pymupdf.open() as merged_pdf:
+            for file_id in files:
+                message = await event.client.get_messages(event.chat_id, ids=file_id)
+                async with download_to_temp_file(
+                    event,
+                    message,
+                    progress_message,
+                    suffix='.pdf',
+                ) as temp_file_path:
+                    with pymupdf.open(temp_file_path) as pdf_doc:
+                        merged_pdf.insert_pdf(pdf_doc)
+            with NamedTemporaryFile(dir=TMP_DIR, suffix='.pdf') as out_file:
+                merged_pdf.save(out_file.name, **PDF_SAVE_KWARGS)
+                output_file_path = Path(out_file.name)
+                if output_file_path.exists() and output_file_path.stat().st_size:
+                    output_file_path = output_file_path.rename(
+                        output_file_path.with_name(
+                            output_filename or f'merged_{Path(message.file.name).stem}.pdf'
+                        )
+                    )
+                    await upload_file_and_cleanup(event, output_file_path, progress_message)
+                    await status_message.edit(t('merge_completed'))
+                else:
+                    await status_message.edit(t('merge_failed'))
+    finally:
+        with suppress(Exception):
+            await progress_message.delete()
+        with suppress(Exception):
+            await event.client.delete_messages(event.chat_id, cleanup_ids)
 
 
 async def _split_pdf_process(
@@ -1274,3 +1357,10 @@ class PDF(ModuleBase):
             is_applicable_for_reply=True,
         ),
     }
+
+    @staticmethod
+    def register_handlers(bot: Any) -> None:
+        bot.add_event_handler(
+            _merge_filename_callback,
+            CallbackQuery(pattern=r'^pdfmerge\|'),
+        )
