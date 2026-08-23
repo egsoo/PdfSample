@@ -21,6 +21,7 @@ from telethon.events import CallbackQuery, InlineQuery, NewMessage, StopPropagat
 
 from src import API_HASH, API_ID, BOT_ADMINS, BOT_TOKEN, STATE_DIR, TMP_DIR
 from src.modules.base import InlineModuleBase, ModuleBase, matches_command
+from src.modules.core.plugin_manager import start_menu_buttons, start_menu_text
 from src.modules.core.tasks_manager import ActiveTask, next_task_id
 from src.utils.i18n import t
 from src.utils.modules_registry import ModuleRegistry
@@ -282,7 +283,7 @@ async def handle_inline_query(event: InlineQuery.Event) -> None:
 
 
 async def start_command(event: NewMessage.Event) -> None:
-    await event.reply(t("welcome"))
+    await event.reply(start_menu_text(), buttons=start_menu_buttons())
     raise StopPropagation
 
 
