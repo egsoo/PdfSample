@@ -99,6 +99,7 @@ class FileCollector:
     chat_id: int
     prompt_message_id: int
     file_message_ids: list[int]
+    notice_message_ids: list[int]
     accept: Callable[[NewMessage.Event], bool]
     on_finish: Callable[[CallbackQuery.Event, list[int]], Awaitable[None]] | None
     on_complete: Callable[[NewMessage.Event, list[int]], Awaitable[None]] | None
@@ -108,6 +109,10 @@ class FileCollector:
     added_reply_text: str | None
     allow_non_reply: bool
     timeout_seconds: int | None
+    cleanup_on_finish: bool
+    remove_button_text: str | None
+    prompt_text: str
+    finish_button_text: str | None
 
 
 class FileCollectorManager:
@@ -132,6 +137,8 @@ class FileCollectorManager:
         allow_non_reply: bool = True,
         reply_to: int | None = None,
         timeout_seconds: int | None = 60 * 15,
+        cleanup_on_finish: bool = False,
+        remove_button_text: str | None = None,
     ) -> Message:
         if isinstance(event, CallbackQuery.Event):
             await event.answer()
@@ -142,7 +149,11 @@ class FileCollectorManager:
             chat_id = event.chat_id
             default_reply_to = event.message.id
 
-        buttons = [Button.inline(finish_button_text, b'c|finish')] if finish_button_text else None
+        buttons = self._collection_buttons(
+            first_message_id,
+            finish_button_text=finish_button_text,
+            remove_button_text=remove_button_text,
+        )
 
         bot_reply = await event.reply(
             prompt_text,
@@ -155,6 +166,7 @@ class FileCollectorManager:
             chat_id=chat_id,
             prompt_message_id=bot_reply.id,
             file_message_ids=[first_message_id],
+            notice_message_ids=[],
             accept=accept,
             on_finish=on_finish,
             on_complete=on_complete,
@@ -164,6 +176,10 @@ class FileCollectorManager:
             added_reply_text=added_reply_text,
             allow_non_reply=allow_non_reply,
             timeout_seconds=timeout_seconds,
+            cleanup_on_finish=cleanup_on_finish,
+            remove_button_text=remove_button_text,
+            prompt_text=prompt_text,
+            finish_button_text=finish_button_text,
         )
 
         if timeout_seconds:
@@ -210,8 +226,9 @@ class FileCollectorManager:
 
         collector.file_message_ids.append(event.id)
         if collector.added_reply_text:
-            buttons = [Button.inline(t('finish'), b'c|finish')] if collector.on_finish else None
-            await event.reply(collector.added_reply_text, buttons=buttons)
+            buttons = self._collection_buttons(event.id, collector=collector)
+            notice = await event.reply(collector.added_reply_text, buttons=buttons)
+            collector.notice_message_ids.append(notice.id)
 
         if (
             collector.on_complete
@@ -256,6 +273,15 @@ class FileCollectorManager:
             try:
                 await collector.on_finish(event, collector.file_message_ids)
             finally:
+                if collector.cleanup_on_finish:
+                    await event.client.delete_messages(
+                        collector.chat_id,
+                        [
+                            collector.prompt_message_id,
+                            *collector.file_message_ids,
+                            *collector.notice_message_ids,
+                        ],
+                    )
                 self._pop(key)
             return True
 
@@ -264,4 +290,73 @@ class FileCollectorManager:
             await event.answer()
             return True
 
+        if action == 'remove':
+            try:
+                file_id = int(data.split('|', 2)[2])
+            except (IndexError, ValueError):
+                return False
+            if file_id in collector.file_message_ids:
+                await event.edit(
+                    'Are you sure you want to remove this file?',
+                    buttons=[[
+                        Button.inline('Yes, remove', f'c|remove_confirm|{file_id}'),
+                        Button.inline('Cancel', f'c|remove_cancel|{file_id}'),
+                    ]],
+                )
+                await event.answer()
+                return True
+
+        if action in {'remove_confirm', 'remove_cancel'}:
+            try:
+                file_id = int(data.split('|', 2)[2])
+            except (IndexError, ValueError):
+                return False
+            if action == 'remove_cancel':
+                if event.message_id == collector.prompt_message_id:
+                    await event.edit(
+                        collector.prompt_text,
+                        buttons=self._collection_buttons(file_id, collector=collector),
+                    )
+                else:
+                    await event.edit(
+                        collector.added_reply_text or 'File added',
+                        buttons=self._collection_buttons(file_id, collector=collector),
+                    )
+                await event.answer()
+                return True
+            if file_id in collector.file_message_ids:
+                collector.file_message_ids.remove(file_id)
+            if event.message_id != collector.prompt_message_id:
+                await event.delete()
+            else:
+                await event.edit(
+                    collector.prompt_text,
+                    buttons=(
+                        self._collection_buttons(
+                            collector.file_message_ids[0], collector=collector
+                        )
+                        if collector.file_message_ids
+                        else None
+                    ),
+                )
+            await event.answer('File removed')
+            return True
+
         return False
+
+    @staticmethod
+    def _collection_buttons(
+        file_id: int,
+        *,
+        finish_button_text: str | None = None,
+        remove_button_text: str | None = None,
+        collector: FileCollector | None = None,
+    ) -> list[Button] | None:
+        finish_button_text = finish_button_text or (collector.finish_button_text if collector else None)
+        remove_button_text = remove_button_text or (collector.remove_button_text if collector else None)
+        buttons = []
+        if remove_button_text:
+            buttons.append(Button.inline(remove_button_text, f'c|remove|{file_id}'))
+        if finish_button_text:
+            buttons.append(Button.inline(finish_button_text, b'c|finish'))
+        return buttons or None
